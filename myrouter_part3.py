@@ -11,14 +11,15 @@ import time
 from switchyard.lib.packet.util import *
 from switchyard.lib.userlib import *
 from collections import OrderedDict
+from collections import deque
 class Router(object):
     def __init__(self, net):
         self.net = net
         self.forwarding_table = self.build_forwarding_table()
         self.arp_table={}#store ip addr - [timestamp, MAC] mapping
         self.queue=OrderedDict()
-        #for each ip addr, store a list of packets arriving in fifo order, timestamp of last use of this entry, counter for #arp requests has sent so far, output port
-
+        #for each ip addr, store a list of packets arriving in fifo order, output port, counter for #arp requests has sent so far, timestamp of last use of this entry
+        self.drt = deque(maxlen=5)#dynamic_routing_table
     def build_forwarding_table(self):
         forwarding_table = []
         raw_lines = [line.rstrip('\n') for line in open('./forwarding_table.txt')]
@@ -27,7 +28,7 @@ class Router(object):
             forwarding_table.append([IPv4Address(temp[0]),IPv4Address(temp[1]),IPv4Address(temp[2]),temp[3]])
         for intf in self.net.interfaces():
             network_prefix = int(intf.ipaddr) & int(intf.netmask)
-            temp = [IPv4Address(network_prefix), intf.netmask, None, intf.name] #the network address, the subnet mask, the next hop address, and the interface
+            temp = [IPv4Address(network_prefix), intf.netmask, None, intf.name] #the prefix network address, the subnet mask, the next hop address, and the interface
             forwarding_table.append(temp)
         return forwarding_table
     
@@ -36,18 +37,26 @@ class Router(object):
             if self.queue[ip][2] == 3: #reached 3 requests and no response drop packet give up this entry 
                 del queue[ip]
                 continue
-            if time.time() - self.queue[ip][1] <= 1: #not yet 3 requests and no reply within 1 sec, send a request
-                intf = self.queue[ip][3]
+            if time.time() - self.queue[ip][3] <= 1: #not yet 3 requests and no reply within 1 sec, send a request
+                intf = self.queue[ip][1]
                 srcMAC = self.net.interface_by_name(intf).ethaddr
                 srcIP = self.net.interface_by_name(intf).ipaddr
                 destIP = ip
                 self.net.send_packet(intf,create_ip_arp_request(srcMAC,srcIP,destIP))
-                self.queue[ip][1] = time.time() #update timestamp
+                self.queue[ip][3] = time.time() #update timestamp
                 self.queue[ip][2] += 1 #update counter for #arp requests
     
-    def lpf_matching(self,ipv4_header):
+    def lpf_matching(self,ipv4_header):#lookup first in dynammic routing table then forwarding table
         max = -1
         matched_result = None
+        for entry in list(self.drt):
+            netaddr = IPv4Network(str(entry[0])+'/'+str(entry[1]))
+            if ipv4_header.dst in netaddr:
+                if netaddr.prefixlen > max:
+                    max = netaddr.prefixlen
+                    matched_result = entry
+        if matched_result:
+            return matched_result
         for entry in self.forwarding_table:
             netaddr = IPv4Network(str(entry[0])+'/'+str(entry[1]))
             if ipv4_header.dst in netaddr:
@@ -80,6 +89,7 @@ class Router(object):
                 log_debug("Got a packet: {}".format(str(pkt)))
                 arp = pkt.get_header(Arp)
                 ipv4_h = pkt.get_header(IPv4)
+                dyn_h = pkt.get_header_by_name("DynamicRoutingMessage")
                 reply_handled = False
                 if arp:
                     srcIP = arp.senderprotoaddr
@@ -94,7 +104,7 @@ class Router(object):
                             if destIP in my_ips:
                                 self.arp_table[srcIP] = [srcMAC,time.time()] #add a IP MAC mapping with timestamp (only if targeted @ my device)
                         if srcIP in self.queue:#if the ip is in arp resolution queue
-                            out_intf = self.queue[srcIP][3]
+                            out_intf = self.queue[srcIP][1]
                             for packet in self.queue[srcIP][0]:#complete eth header for each packet buffered for this ip and send everything out
                                 if not packet[0]:
                                     packet+=Ethernet()
@@ -116,23 +126,27 @@ class Router(object):
                     if not matched_entry:#no match, drop packet
                         continue
                     next_hop = matched_entry[2] if matched_entry[2] else ipv4_h.dst#when it is none use destIP of incomming packet itself
+                    intf_name = matched_entry[3]
                     if next_hop in self.arp_table:#already have destMAC because of previous request - simple lookup & add eth header & send
                         if not pkt[0]:
                             pkt+=Ethernet()
-                        pkt[0].src = self.net.interface_by_name(matched_entry[3]).ethaddr
+                        pkt[0].src = self.net.interface_by_name(intf_name).ethaddr
                         pkt[0].dst = self.arp_table[next_hop][0]
-                        self.net.send_packet(matched_entry[3],pkt)
+                        self.net.send_packet(intf_name,pkt)
                         self.arp_table[next_hop][1] = time.time() #update time of use this arp entry
                     else:#do not have destMAC need arp resolution
                         if next_hop in self.queue:#already have this ip entry in the queue, append an additional packet to its packet list
                             self.queue[next_hop][0].append(pkt)
                         else:#immediately send a request and add this  new  entry to queue
-                            srcMAC=self.net.interface_by_name(matched_entry[3]).ethaddr
-                            srcIP=self.net.interface_by_name(matched_entry[3]).ipaddr
+                            srcMAC=self.net.interface_by_name(intf_name).ethaddr
+                            srcIP=self.net.interface_by_name(intf_name).ipaddr
                             destIP=next_hop
-                            self.net.send_packet(matched_entry[3],create_ip_arp_request(srcMAC,srcIP,destIP))
-                            self.queue[next_hop] = [[pkt], time.time(), 1, matched_entry[3]]
-
+                            self.net.send_packet(intf_name,create_ip_arp_request(srcMAC,srcIP,destIP))
+                            self.queue[next_hop] = [[pkt], intf_name, 1, time.time()]
+                if dyn_h:
+                    #print("dyn header:|prefix: " + dyn_h.advertised_prefix.exploded + "|mask: " + dyn_h.advertised_mask.exploded + "|next_hop: " + dyn_h.next_hop.exploded)
+                    new_entry = [dyn_h.advertised_prefix, dyn_h.advertised_mask, dyn_h.next_hop, dev]
+                    self.drt.append(new_entry)
 def main(net):
     '''
     Main entry point for router.  Just create Router
@@ -141,3 +155,4 @@ def main(net):
     r = Router(net)
     r.router_main()
     net.shutdown()
+
