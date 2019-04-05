@@ -42,12 +42,12 @@ class Router(object):
                     destIP = arp.targetprotoaddr
                     srcMAC = arp.senderhwaddr
                     my_interfaces = self.net.interfaces()
-                    if arp and arp.operation==ArpOperation.Request:
+                    if arp.operation==ArpOperation.Request:
                         for intf in my_interfaces:
                             if destIP == intf.ipaddr:
                                 reply_pkt = create_ip_arp_reply(intf.ethaddr,srcMAC,destIP,srcIP)
                                 self.net.send_packet(intf,reply_pkt)#send arp reply for the request
-                    elif arp and arp.operation==ArpOperation.Reply:
+                    elif arp.operation==ArpOperation.Reply:
                         for intf in my_interfaces:
                             if destIP == intf.ipaddr:
                                 arp_table[srcIP] = srcMAC #add a mapping
